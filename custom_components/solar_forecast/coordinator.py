@@ -32,7 +32,7 @@ import logging
 import math
 import os
 import sqlite3
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -70,6 +70,11 @@ class SolarForecastCoordinator:
         self._db: sqlite3.Connection | None = None
         self._listeners: list[Callable] = []
         self._update_callbacks: list[Callable] = []
+
+        # Rolling buffer of (utc_datetime, watts) from the power sensor.
+        # Every state change is appended here; the 15-min tick drains old entries
+        # and computes a time-weighted average for the completed slot.
+        self._power_buffer: deque[tuple[datetime, float]] = deque()
 
         # Publicly readable state (read by sensor entity)
         self.forecast: list[dict] = []
@@ -358,15 +363,72 @@ class SolarForecastCoordinator:
 
     # ── Data collection ───────────────────────────────────────────────────────
 
-    async def _record_current_slot(self, now_utc: datetime) -> None:
-        """Sample and store one (OM-forecast, actual) pair for the current slot."""
-        # Actual inverter power
-        power_state = self.hass.states.get(self._power_entity)
-        if power_state is None or power_state.state in ("unknown", "unavailable"):
+    @callback
+    def _on_power_state_change(self, event) -> None:
+        """Append every inverter power reading to the rolling buffer."""
+        new_state = event.data.get("new_state")
+        if new_state is None or new_state.state in ("unknown", "unavailable"):
             return
         try:
-            actual_w = float(power_state.state)
+            val = float(new_state.state)
         except ValueError:
+            return
+        self._power_buffer.append((datetime.now(timezone.utc), val))
+
+    def _slot_average_w(self, slot_end_utc: datetime) -> float | None:
+        """
+        Compute the time-weighted average power (W) for the 15-min slot that
+        just finished ending at *slot_end_utc*.
+
+        Uses trapezoidal integration over all readings in the window, with the
+        first and last values extended to the slot boundaries so the full 15
+        minutes is always covered even if the sensor didn't update exactly at
+        the boundary.
+
+        Returns None if there are no readings in the window at all (e.g. HA
+        just started and the buffer is empty).
+        """
+        slot_start = slot_end_utc - timedelta(minutes=15)
+
+        # Collect readings that fall inside the slot window
+        window = [
+            (ts, w) for ts, w in self._power_buffer if slot_start <= ts <= slot_end_utc
+        ]
+
+        # Prune buffer entries older than the previous slot (keep a little extra)
+        prune_before = slot_start - timedelta(minutes=5)
+        while self._power_buffer and self._power_buffer[0][0] < prune_before:
+            self._power_buffer.popleft()
+
+        if not window:
+            # Fall back to the most recent reading in the buffer if any
+            if self._power_buffer:
+                return self._power_buffer[-1][1]
+            return None
+
+        if len(window) == 1:
+            return window[0][1]
+
+        # Extend to slot boundaries using nearest edge value
+        points = [(slot_start, window[0][1])] + window + [(slot_end_utc, window[-1][1])]
+
+        total_watt_seconds = 0.0
+        total_seconds = 0.0
+        for i in range(len(points) - 1):
+            t1, v1 = points[i]
+            t2, v2 = points[i + 1]
+            dt = (t2 - t1).total_seconds()
+            total_watt_seconds += (v1 + v2) / 2 * dt
+            total_seconds += dt
+
+        return total_watt_seconds / total_seconds if total_seconds > 0 else window[0][1]
+
+    async def _record_current_slot(self, now_utc: datetime) -> None:
+        """Store the time-weighted average (OM-forecast, actual) pair for the slot."""
+        # Time-weighted average power over the completed 15-min slot
+        actual_w = self._slot_average_w(now_utc)
+        if actual_w is None:
+            _LOGGER.debug("No power readings in buffer, skipping slot recording")
             return
 
         # OM forecast for the current slot
@@ -385,7 +447,7 @@ class SolarForecastCoordinator:
             self._upsert_reading, local_date, slot, om_w, actual_w
         )
         _LOGGER.debug(
-            "Recorded %s slot %d: om=%.1f W  actual=%.1f W",
+            "Recorded %s slot %d: om=%.1f W  actual=%.1f W (15-min avg)",
             local_date,
             slot,
             om_w,
@@ -444,6 +506,15 @@ class SolarForecastCoordinator:
                 self.hass,
                 [self._forecast_entity],
                 self._on_forecast_updated,
+            )
+        )
+
+        # Buffer every power sensor change for time-weighted averaging
+        self._listeners.append(
+            async_track_state_change_event(
+                self.hass,
+                [self._power_entity],
+                self._on_power_state_change,
             )
         )
 
