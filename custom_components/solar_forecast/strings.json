@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Solar Forecast Refinement",
+        "description": "Configure the Open Meteo forecast sensor and the inverter power sensor. The component will learn to correct the forecast from the inverter's actual output.",
+        "data": {
+          "forecast_entity": "Open Meteo forecast sensor (today)",
+          "power_entity": "Inverter actual power sensor (W)",
+          "forecast_tomorrow_entity": "Open Meteo forecast sensor (tomorrow) – optional"
+        }
+      }
+    },
+    "error": {
+      "entity_not_found": "Entity not found – check the entity ID and try again."
+    },
+    "abort": {
+      "already_configured": "This sensor pair is already configured."
+    }
+  }
+}
