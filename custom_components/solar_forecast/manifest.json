@@ -1,13 +1,13 @@
 {
   "domain": "solar_forecast",
   "name": "Solar Forecast Refinement",
-  "version": "1.0.0",
+  "codeowners": ["@Klurige"],
   "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/Klurige/solar_forecast",
   "integration_type": "service",
   "iot_class": "local_push",
-  "documentation": "https://github.com/Klurige/solar_forecast",
   "issue_tracker": "https://github.com/Klurige/solar_forecast/issues",
-  "codeowners": ["@Klurige"],
   "requirements": [],
-  "dependencies": []
+  "version": "1.0.0"
 }
