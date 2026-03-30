@@ -94,9 +94,13 @@ class SolarForecastSensor(SensorEntity):
 
     @property
     def native_value(self) -> float:
-        """Total corrected kWh for the next 24 hours."""
+        """Total corrected kWh for the next 24 hours (first 96 of 192 entries)."""
         return round(
-            sum(e["pv_estimate"] * 0.25 for e in self._coordinator.forecast), 2
+            sum(
+                e["pv_estimate"] * 0.25
+                for e in self._coordinator.forecast[:SLOTS_PER_DAY]
+            ),
+            2,
         )
         # pv_estimate is in kW; each slot is 15 min = 0.25 h → kWh
 

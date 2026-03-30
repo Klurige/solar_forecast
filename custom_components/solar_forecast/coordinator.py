@@ -221,17 +221,17 @@ class SolarForecastCoordinator:
 
     def _collect_om_data(self) -> dict[datetime, float]:
         """
-        Collect Open Meteo forecast data for the next 24 h from the
+        Collect Open Meteo forecast data for the next 48 h from the
         configured forecast entity (and optionally the tomorrow entity).
 
         Supports two attribute formats:
           * ``watts``     – dict  {ISO-timestamp: W}  (Open Meteo style)
           * ``forecasts`` – list  [{period_end, pv_estimate (kW)}]  (Solcast style)
 
-        Returns a dict mapping UTC datetime → watts for the next 24 h window.
+        Returns a dict mapping UTC datetime → watts for the next 48 h window.
         """
         now_utc = datetime.now(timezone.utc)
-        horizon = now_utc + timedelta(hours=25)  # slightly over 24h
+        horizon = now_utc + timedelta(hours=49)  # slightly over 48 h
         result: dict[datetime, float] = {}
 
         entities = [self._forecast_entity]
@@ -289,7 +289,12 @@ class SolarForecastCoordinator:
 
     def _build_forecast(self) -> list[dict]:
         """
-        Build 96 corrected 15-min forecast entries covering the next 24 h.
+        Build 192 corrected 15-min forecast entries covering the next 48 h.
+
+        48 h ensures tomorrow's full calendar day is always present regardless
+        of the current time of day. The sensor state (next-24 h kWh) is
+        computed from the first 96 entries; the remaining 96 entries are used
+        by the tomorrow Lovelace card.
 
         Each entry:
             period_end          ISO string (UTC)
@@ -314,7 +319,7 @@ class SolarForecastCoordinator:
         ) + timedelta(minutes=next_boundary_minutes)
 
         entries: list[dict] = []
-        for i in range(SLOTS_PER_DAY):
+        for i in range(2 * SLOTS_PER_DAY):  # 192 slots = 48 h
             period_end = first_period_end + timedelta(minutes=15 * i)
             slot = self._slot_from_utc(period_end)
 
