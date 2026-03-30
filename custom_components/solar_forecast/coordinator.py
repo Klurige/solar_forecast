@@ -233,10 +233,14 @@ class SolarForecastCoordinator:
           * ``watts``     – dict  {ISO-timestamp: W}  (Open Meteo style)
           * ``forecasts`` – list  [{period_end, pv_estimate (kW)}]  (Solcast style)
 
-        Returns a dict mapping UTC datetime → watts for the next 48 h window.
+        Returns a dict mapping UTC datetime → watts covering today + tomorrow.
         """
-        now_utc = datetime.now(timezone.utc)
-        horizon = now_utc + timedelta(hours=49)  # slightly over 48 h
+        # Anchor to local midnight so past slots of today are included.
+        # The chart spans the full calendar day; we need historical values too.
+        now_local = datetime.now(self._local_tz)
+        local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start_utc = local_midnight.astimezone(timezone.utc)
+        horizon = day_start_utc + timedelta(hours=49)  # today + tomorrow + 1 h buffer
         result: dict[datetime, float] = {}
 
         entities = [self._forecast_entity]
@@ -253,7 +257,7 @@ class SolarForecastCoordinator:
             watts: dict = state.attributes.get("watts") or {}
             for ts_str, w in watts.items():
                 dt = self._parse_ts(ts_str)
-                if dt is not None and now_utc <= dt < horizon:
+                if dt is not None and day_start_utc <= dt < horizon:
                     try:
                         result[dt] = float(w)
                     except (ValueError, TypeError):
@@ -269,7 +273,7 @@ class SolarForecastCoordinator:
                         or ""
                     )
                     dt = self._parse_ts(ts_str)
-                    if dt is None or not (now_utc <= dt < horizon):
+                    if dt is None or not (day_start_utc <= dt < horizon):
                         continue
                     # pv_estimate is in kW → convert to W
                     w = (
@@ -294,14 +298,14 @@ class SolarForecastCoordinator:
 
     def _build_forecast(self) -> list[dict]:
         """
-        Build 192 corrected 15-min forecast entries covering the next 48 h.
+        Build 192 corrected 15-min forecast entries covering today + tomorrow.
 
-        48 h ensures tomorrow's full calendar day is always present regardless
-        of the current time of day. The sensor state (next-24 h kWh) is
-        computed from the first 96 entries; the remaining 96 entries are used
-        by the tomorrow Lovelace card.
+        The forecast is anchored to local midnight (00:15 first slot) so the
+        full calendar day is always present in the attributes, regardless of the
+        current time.  This ensures the ApexCharts card shows an unbroken line
+        across the whole day even in the afternoon.
 
-        Each entry:
+        Entry layout:
             period_end          ISO string (UTC)
             pv_estimate         float kW  (corrected)
             pv_estimate_raw     float kW  (from Open Meteo, uncorrected)
@@ -314,17 +318,15 @@ class SolarForecastCoordinator:
             )
             return []
 
-        now_utc = datetime.now(timezone.utc)
-
-        # Round up to next 15-min boundary
-        minutes_into_hour = now_utc.minute
-        next_boundary_minutes = ((minutes_into_hour // 15) + 1) * 15
-        first_period_end = now_utc.replace(
-            minute=0, second=0, microsecond=0
-        ) + timedelta(minutes=next_boundary_minutes)
+        # Anchor to local midnight so today's past slots are included
+        now_local = datetime.now(self._local_tz)
+        local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        first_period_end = local_midnight.astimezone(timezone.utc) + timedelta(
+            minutes=15
+        )
 
         entries: list[dict] = []
-        for i in range(2 * SLOTS_PER_DAY):  # 192 slots = 48 h
+        for i in range(2 * SLOTS_PER_DAY):  # 192 slots = today + tomorrow
             period_end = first_period_end + timedelta(minutes=15 * i)
             slot = self._slot_from_utc(period_end)
 

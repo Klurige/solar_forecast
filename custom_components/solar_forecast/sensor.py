@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -22,11 +23,18 @@ from .const import (
     ATTR_FORECASTS,
     ATTR_TOTAL_SAMPLES,
     DOMAIN,
-    SLOTS_PER_DAY,
 )
 from .coordinator import SolarForecastCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _local_date(period_end_iso: str, tz: ZoneInfo) -> date:
+    """Parse a period_end ISO string and return its local calendar date."""
+    dt = datetime.fromisoformat(period_end_iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz).date()
 
 
 async def async_setup_entry(
@@ -94,11 +102,15 @@ class SolarForecastSensor(SensorEntity):
 
     @property
     def native_value(self) -> float:
-        """Total corrected kWh for the next 24 hours (first 96 of 192 entries)."""
+        """Total corrected kWh estimated for today (full calendar day)."""
+        now_utc = datetime.now(timezone.utc)
+        today_local = now_utc.astimezone(self._coordinator._local_tz).date()
         return round(
             sum(
                 e["pv_estimate"] * 0.25
-                for e in self._coordinator.forecast[:SLOTS_PER_DAY]
+                for e in self._coordinator.forecast
+                if _local_date(e["period_end"], self._coordinator._local_tz)
+                == today_local
             ),
             2,
         )
