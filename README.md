@@ -245,7 +245,91 @@ kW
 
 ---
 
-## Tuning
+### Tomorrow's forecast card
+
+Shows only the two forecasts for **tomorrow** (no actual power, since it hasn't happened yet).
+The `data_generator` filters entries whose `period_end` falls on tomorrow's local date.
+
+```yaml
+type: custom:apexcharts-card
+header:
+  show: true
+  title: Solprognos imorgon – Original vs Raffinerad (kW)
+graph_span: 24h
+span:
+  start: day
+  offset: +1d
+yaxis:
+  - id: kW
+    decimals: 1
+    min: 0
+apex_config:
+  yaxis:
+    - title:
+        text: kW
+  markers:
+    size: 0
+  legend:
+    position: top
+
+series:
+  # ── Original Open Meteo forecast for tomorrow (uncorrected) ──────────────
+  - entity: sensor.solar_forecast_refined
+    name: Prognos – Open Meteo
+    type: line
+    yaxis_id: kW
+    color: "#4caf50"
+    stroke_width: 1
+    curve: smooth
+    opacity: 0.6
+    data_generator: |
+      const list = entity?.attributes?.forecasts ?? [];
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      const tomorrowDate = tomorrow.toISOString().slice(0, 10);
+      return list
+        .map(f => {
+          if (!f.period_end) return null;
+          const x = new Date(f.period_end);
+          if (x.toISOString().slice(0, 10) !== tomorrowDate) return null;
+          const y = Number(f.pv_estimate_raw);
+          return Number.isFinite(y) ? [x, y] : null;
+        })
+        .filter(Boolean)
+        .sort((a, b) => a[0] - b[0]);
+    unit: kW
+
+  # ── Refined forecast for tomorrow (bias-corrected) ────────────────────────
+  - entity: sensor.solar_forecast_refined
+    name: Prognos – Raffinerad
+    type: line
+    yaxis_id: kW
+    color: "#00b3ff"
+    stroke_width: 2
+    curve: smooth
+    data_generator: |
+      const list = entity?.attributes?.forecasts ?? [];
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      const tomorrowDate = tomorrow.toISOString().slice(0, 10);
+      return list
+        .map(f => {
+          if (!f.period_end) return null;
+          const x = new Date(f.period_end);
+          if (x.toISOString().slice(0, 10) !== tomorrowDate) return null;
+          const y = Number(f.pv_estimate);
+          return Number.isFinite(y) ? [x, y] : null;
+        })
+        .filter(Boolean)
+        .sort((a, b) => a[0] - b[0]);
+    unit: kW
+```
+
+> **Note:** Tomorrow's entries are only available if `sensor.energy_production_tomorrow_2`
+> was configured as the *tomorrow* entity during integration setup.
+
+---
+
 
 All algorithm parameters live in `const.py`:
 
