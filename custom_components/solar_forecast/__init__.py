@@ -11,6 +11,7 @@ Installation
 3. Settings → Integrations → Add → "Solar Forecast Refinement"
 4. Select your forecast sensor and inverter power sensor.
 """
+
 from __future__ import annotations
 
 import logging

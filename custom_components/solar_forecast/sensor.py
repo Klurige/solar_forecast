@@ -1,4 +1,5 @@
 """Sensor platform for Solar Forecast Refinement."""
+
 from __future__ import annotations
 
 import logging
@@ -113,9 +114,7 @@ class SolarForecastSensor(SensorEntity):
                 period_end = datetime.fromisoformat(entry["period_end"])
                 if period_end.tzinfo is None:
                     period_end = period_end.replace(tzinfo=timezone.utc)
-                period_date = period_end.astimezone(
-                    self._coordinator._local_tz
-                ).date()
+                period_date = period_end.astimezone(self._coordinator._local_tz).date()
                 kwh = entry["pv_estimate"] * 0.25  # kW × 0.25h
                 if period_date == today_date:
                     today_kwh += kwh

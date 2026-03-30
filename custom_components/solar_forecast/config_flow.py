@@ -1,4 +1,5 @@
 """Config flow for Solar Forecast Refinement."""
+
 from __future__ import annotations
 
 import voluptuous as vol

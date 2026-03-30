@@ -25,6 +25,7 @@ Applied to the current forecast:
 Slots with fewer than MIN_CORRECTION_SAMPLES observations fall back to the
 overall weighted mean across all slots.
 """
+
 from __future__ import annotations
 
 import logging
@@ -105,8 +106,7 @@ class SolarForecastCoordinator:
         conn = sqlite3.connect(self._db_path(), check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS readings (
                 date     TEXT    NOT NULL,   -- ISO date, local calendar day
                 slot     INTEGER NOT NULL,   -- 0-95, UTC-based 15-min slot
@@ -114,8 +114,7 @@ class SolarForecastCoordinator:
                 actual_w REAL    NOT NULL,   -- Inverter actual watts
                 PRIMARY KEY (date, slot)
             )
-            """
-        )
+            """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_slot ON readings(slot)")
         conn.commit()
         return conn
@@ -191,7 +190,9 @@ class SolarForecastCoordinator:
             if len(data) >= MIN_CORRECTION_SAMPLES:
                 total_w = sum(w for _, w in data)
                 factors[slot] = (
-                    sum(r * w for r, w in data) / total_w if total_w > 0 else overall_mean
+                    sum(r * w for r, w in data) / total_w
+                    if total_w > 0
+                    else overall_mean
                 )
             else:
                 factors[slot] = overall_mean
@@ -266,11 +267,14 @@ class SolarForecastCoordinator:
                     if dt is None or not (now_utc <= dt < horizon):
                         continue
                     # pv_estimate is in kW → convert to W
-                    w = float(
-                        entry.get("pv_estimate")
-                        or entry.get("pv_estimate_mean")
-                        or 0
-                    ) * 1000
+                    w = (
+                        float(
+                            entry.get("pv_estimate")
+                            or entry.get("pv_estimate_mean")
+                            or 0
+                        )
+                        * 1000
+                    )
                     result[dt] = w
                 except (ValueError, TypeError, KeyError):
                     pass
@@ -376,7 +380,11 @@ class SolarForecastCoordinator:
             self._upsert_reading, local_date, slot, om_w, actual_w
         )
         _LOGGER.debug(
-            "Recorded %s slot %d: om=%.1f W  actual=%.1f W", local_date, slot, om_w, actual_w
+            "Recorded %s slot %d: om=%.1f W  actual=%.1f W",
+            local_date,
+            slot,
+            om_w,
+            actual_w,
         )
 
     async def _refresh(self, now_utc: datetime | None = None) -> None:
@@ -435,8 +443,7 @@ class SolarForecastCoordinator:
         )
 
         _LOGGER.info(
-            "Solar Forecast Refinement set up. "
-            "Forecast=%s  Power=%s  Samples=%d",
+            "Solar Forecast Refinement set up. " "Forecast=%s  Power=%s  Samples=%d",
             self._forecast_entity,
             self._power_entity,
             self.total_samples,
