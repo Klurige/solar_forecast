@@ -53,6 +53,7 @@ from .const import (
     MAX_RATIO,
     MIN_CORRECTION_SAMPLES,
     MIN_RATIO,
+    MIN_TOTAL_SAMPLES_FOR_CORRECTION,
     NIGHT_THRESHOLD_W,
     SLOTS_PER_DAY,
 )
@@ -332,7 +333,13 @@ class SolarForecastCoordinator:
 
             # Find the OM forecast value closest to this period boundary
             raw_w = self._nearest_om_value(om_data, period_end)
-            factor = self.correction_factors.get(slot, 1.0)
+
+            # Only apply corrections once enough historical data is available.
+            # Until then refined == raw so the chart lines overlap.
+            if self.total_samples >= MIN_TOTAL_SAMPLES_FOR_CORRECTION:
+                factor = self.correction_factors.get(slot, 1.0)
+            else:
+                factor = 1.0
 
             # Only apply correction during the day; at night keep zero
             if raw_w >= NIGHT_THRESHOLD_W:
