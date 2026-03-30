@@ -176,7 +176,7 @@ apex_config:
     position: top
 
 series:
-  # ── Actual inverter power ─────────────────────────────────────────────────
+  # ── Actual inverter power (15-min average, matching coordinator sampling) ──
   - entity: sensor.input_power_with_efficiency_loss
     name: Uppmätt
     type: line
@@ -186,6 +186,9 @@ series:
     curve: smooth
     transform: "return x / 1000;"
     unit: kW
+    group_by:
+      duration: 15min
+      func: avg
 
   # ── Original Open Meteo forecast (uncorrected) ────────────────────────────
   - entity: sensor.solar_forecast_refined
