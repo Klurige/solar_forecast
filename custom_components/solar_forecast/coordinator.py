@@ -242,20 +242,89 @@ class SolarForecastCoordinator:
             """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_slot ON readings(slot)")
 
-        # Schema migration: version 2 changed slot keys from UTC to local time.
-        # The two are incompatible so clear the table when upgrading.
+        # Schema migration: apply version-specific transforms, or clear
+        # incompatible data if no migration path is available.
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         if version < DB_SCHEMA_VERSION:
-            conn.execute("DELETE FROM readings")
-            conn.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
             _LOGGER.info(
-                "Solar Forecast DB migrated to schema v%d; "
-                "historical readings cleared (slot key changed from UTC to local time)",
+                "Solar Forecast DB: migrating schema v%d → v%d",
+                version,
                 DB_SCHEMA_VERSION,
             )
+            if version < 2:
+                # v0/v1 used UTC-based slots and had a bug where om_w was
+                # always 0 (< NIGHT_THRESHOLD_W), so no valid data was ever
+                # stored.  Safe to clear.
+                conn.execute("DELETE FROM readings")
+                _LOGGER.info("Schema v0/v1: no valid data, cleared readings table")
+            if version == 2:
+                # v2 used local-time slots (0-95).  Migrate to solar-position
+                # bins by reconstructing the local datetime for each row and
+                # computing the sun's elevation + azimuth.  Rows that fall in
+                # the same new bin are averaged together.
+                self._migrate_v2_to_v3(conn)
+            conn.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
 
         conn.commit()
         return conn
+
+    def _migrate_v2_to_v3(self, conn: sqlite3.Connection) -> None:
+        """
+        Migrate schema v2 (local-time slots 0-95) to v3 (solar-position bins).
+
+        For each stored (date, local_slot) row:
+          1. Reconstruct the local datetime at the midpoint of the 15-min slot.
+          2. Convert to UTC and compute the solar-position bin.
+          3. Discard nighttime rows (bin == -1).
+          4. Average om_w / actual_w for rows that map to the same new bin
+             on the same date (multiple 15-min local slots often fall in the
+             same 10°×30° solar bin).
+        """
+        tz = ZoneInfo(self.hass.config.time_zone)
+        lat = self.hass.config.latitude
+        lon = self.hass.config.longitude
+
+        rows = conn.execute(
+            "SELECT date, slot, om_w, actual_w FROM readings"
+        ).fetchall()
+
+        if not rows:
+            _LOGGER.info("Schema v2→v3 migration: no rows to migrate")
+            return
+
+        # Group by (date, new_solar_slot) → list of (om_w, actual_w)
+        buckets: dict[tuple[str, int], list[tuple[float, float]]] = defaultdict(list)
+        for date_str, old_slot, om_w, actual_w in rows:
+            try:
+                d = date.fromisoformat(date_str)
+            except ValueError:
+                continue
+            # Midpoint of the 15-min local-time slot
+            local_dt = datetime(d.year, d.month, d.day, tzinfo=tz) + timedelta(
+                minutes=old_slot * 15 + 7
+            )
+            utc_dt = local_dt.astimezone(timezone.utc)
+            new_slot = _solar_slot(
+                lat, lon, utc_dt, SLOT_ELEVATION_STEP, SLOT_AZIMUTH_BINS
+            )
+            if new_slot < 0:
+                continue  # nighttime; discard
+            buckets[(date_str, new_slot)].append((om_w, actual_w))
+
+        # Re-write the table with merged rows
+        conn.execute("DELETE FROM readings")
+        for (date_str, new_slot), values in buckets.items():
+            avg_om = sum(v[0] for v in values) / len(values)
+            avg_actual = sum(v[1] for v in values) / len(values)
+            conn.execute(
+                "INSERT INTO readings (date, slot, om_w, actual_w) VALUES (?, ?, ?, ?)",
+                (date_str, new_slot, round(avg_om, 2), round(avg_actual, 2)),
+            )
+        _LOGGER.info(
+            "Schema v2→v3 migration: %d rows → %d solar-position bins",
+            len(rows),
+            len(buckets),
+        )
 
     def _ensure_db(self) -> sqlite3.Connection:
         if self._db is None:
