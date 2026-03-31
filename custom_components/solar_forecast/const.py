@@ -31,4 +31,14 @@ INTRADAY_MIN_SCALING = 0.2  # don't scale today's remaining forecast below 20%
 INTRADAY_MAX_SCALING = 3.0  # don't scale today's remaining forecast above 300%
 
 # DB schema version — bump when the storage format changes incompatibly
-DB_SCHEMA_VERSION = 2  # v2: slot key changed from UTC to local time
+# v2: slot key changed from UTC to local time
+# v3: slot key changed from local time to solar-position bin (elev × azim)
+DB_SCHEMA_VERSION = 3
+
+# Solar-position slot configuration
+# Elevation bins: 10° steps from 0° to 90° → 9 bins
+# Azimuth bins:   30° steps around the compass  → 12 sectors
+# Total possible slots: 9 × 12 = 108
+# Encoding: elev_bin * SLOT_AZIMUTH_BINS + azim_bin
+SLOT_ELEVATION_STEP = 10  # degrees per elevation bin
+SLOT_AZIMUTH_BINS = 12  # number of 30° azimuth sectors

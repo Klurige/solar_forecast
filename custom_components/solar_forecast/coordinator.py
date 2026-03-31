@@ -76,10 +76,99 @@ from .const import (
     MIN_CORRECTION_SAMPLES,
     MIN_RATIO,
     NIGHT_THRESHOLD_W,
+    SLOT_AZIMUTH_BINS,
+    SLOT_ELEVATION_STEP,
     SLOTS_PER_DAY,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+# ── Solar position calculation ────────────────────────────────────────────────
+# Pure-Python implementation; no external dependencies required.
+
+
+def _solar_position(
+    lat_deg: float, lon_deg: float, dt_utc: datetime
+) -> tuple[float, float]:
+    """
+    Return (elevation_deg, azimuth_deg) of the sun for the given UTC datetime
+    and geographic coordinates.
+
+    Azimuth is measured clockwise from North (0° = N, 90° = E, 180° = S, 270° = W).
+    Elevation is the angle above the horizon (negative = below horizon).
+
+    Uses the Spencer / Iqbal algorithm accurate to ±0.01° for most dates.
+    """
+    lat = math.radians(lat_deg)
+
+    # Day of year (1-based)
+    doy = dt_utc.timetuple().tm_yday
+
+    # Solar declination (radians) via Spencer's formula
+    b = 2 * math.pi * (doy - 1) / 365
+    decl = (
+        0.006918
+        - 0.399912 * math.cos(b)
+        + 0.070257 * math.sin(b)
+        - 0.006758 * math.cos(2 * b)
+        + 0.000907 * math.sin(2 * b)
+        - 0.002697 * math.cos(3 * b)
+        + 0.00148 * math.sin(3 * b)
+    )
+
+    # Equation of time (minutes) via Spencer's formula
+    eot_min = 229.18 * (
+        0.000075
+        + 0.001868 * math.cos(b)
+        - 0.032077 * math.sin(b)
+        - 0.014615 * math.cos(2 * b)
+        - 0.04089 * math.sin(2 * b)
+    )
+
+    # True solar time (hours)
+    utc_hour = dt_utc.hour + dt_utc.minute / 60 + dt_utc.second / 3600
+    solar_time = utc_hour + lon_deg / 15 + eot_min / 60
+
+    # Hour angle (radians): 0 at solar noon, negative AM, positive PM
+    hour_angle = math.radians((solar_time - 12) * 15)
+
+    # Solar elevation
+    sin_elev = math.sin(lat) * math.sin(decl) + math.cos(lat) * math.cos(
+        decl
+    ) * math.cos(hour_angle)
+    elevation = math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
+
+    # Solar azimuth (clockwise from North)
+    cos_az = (math.sin(decl) - math.sin(lat) * sin_elev) / (
+        math.cos(lat) * math.cos(math.radians(elevation))
+    )
+    cos_az = max(-1.0, min(1.0, cos_az))
+    az = math.degrees(math.acos(cos_az))
+    if math.sin(hour_angle) > 0:  # afternoon → azimuth > 180°
+        az = 360 - az
+
+    return elevation, az
+
+
+def _solar_slot(
+    lat: float, lon: float, dt_utc: datetime, elev_step: int, azim_bins: int
+) -> int:
+    """
+    Map a UTC datetime to a solar-position slot integer.
+
+    Slot encodes: elevation_bin * azim_bins + azimuth_bin
+    where elevation_bin = floor(elevation / elev_step)
+          azimuth_bin   = floor(azimuth / (360 / azim_bins))
+
+    Returns -1 when the sun is below the horizon (nighttime).
+    """
+    elevation, azimuth = _solar_position(lat, lon, dt_utc)
+    if elevation < 0:
+        return -1  # night
+    elev_bin = min(int(elevation // elev_step), (90 // elev_step) - 1)
+    azim_bin = int(azimuth // (360 / azim_bins)) % azim_bins
+    return elev_bin * azim_bins + azim_bin
 
 
 class SolarForecastCoordinator:
@@ -123,6 +212,14 @@ class SolarForecastCoordinator:
     def _local_tz(self) -> ZoneInfo:
         return ZoneInfo(self.hass.config.time_zone)
 
+    @property
+    def _latitude(self) -> float:
+        return self.hass.config.latitude
+
+    @property
+    def _longitude(self) -> float:
+        return self.hass.config.longitude
+
     # ── Database ──────────────────────────────────────────────────────────────
 
     def _db_path(self) -> str:
@@ -137,7 +234,7 @@ class SolarForecastCoordinator:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS readings (
                 date     TEXT    NOT NULL,   -- ISO date, local calendar day
-                slot     INTEGER NOT NULL,   -- 0-95, LOCAL-time-based 15-min slot
+                slot     INTEGER NOT NULL,   -- solar-position bin (elev×azim)
                 om_w     REAL    NOT NULL,   -- Open Meteo forecast watts
                 actual_w REAL    NOT NULL,   -- Inverter actual watts (15-min avg)
                 PRIMARY KEY (date, slot)
@@ -360,15 +457,26 @@ class SolarForecastCoordinator:
 
         return result
 
-    def _slot_from_local(self, dt: datetime) -> int:
-        """Return the 0-95 slot index based on LOCAL time of day.
-
-        Using local time ensures the model learns patterns aligned with the
-        actual solar/shadow cycle rather than UTC, which would drift by 1 h
-        across DST changes and misalign seasonal shadow patterns.
+    def _slot_for(self, dt_utc: datetime) -> int:
         """
-        local = dt.astimezone(self._local_tz)
-        return (local.hour * 60 + local.minute) // 15
+        Return the solar-position slot index for the given UTC datetime.
+
+        Slots encode (elevation_bin, azimuth_bin) as a single integer so the
+        correction model learns factors tied to the physical sun position rather
+        than clock time.  This means a tree that shadows the panels at a
+        specific sun angle is learned once, regardless of which month or time
+        of day that angle occurs.
+
+        Returns -1 for nighttime (sun below horizon), which is excluded from
+        recording and correction.
+        """
+        return _solar_slot(
+            self._latitude,
+            self._longitude,
+            dt_utc,
+            SLOT_ELEVATION_STEP,
+            SLOT_AZIMUTH_BINS,
+        )
 
     # ── Forecast assembly ─────────────────────────────────────────────────────
 
@@ -416,13 +524,13 @@ class SolarForecastCoordinator:
         entries: list[dict] = []
         for i in range(2 * SLOTS_PER_DAY):  # 192 slots = today + tomorrow
             period_end = first_period_end + timedelta(minutes=15 * i)
-            slot = self._slot_from_local(period_end)
+            slot = self._slot_for(period_end)
 
             # Find the OM forecast value closest to this period boundary
             raw_w = self._nearest_om_value(om_data, period_end)
 
-            # Slots not yet in correction_factors (too few samples) default to
-            # factor=1.0 so refined == raw until enough data is collected.
+            # Slots not yet in correction_factors (too few samples, or nighttime
+            # where slot==-1) default to factor=1.0.
             factor = self.correction_factors.get(slot, 1.0)
 
             # Only apply correction during the day; at night keep zero
@@ -539,7 +647,10 @@ class SolarForecastCoordinator:
         if om_w < NIGHT_THRESHOLD_W and actual_w < NIGHT_THRESHOLD_W:
             return
 
-        slot = self._slot_from_local(now_utc)
+        # Determine solar-position slot; skip nighttime (slot == -1)
+        slot = self._slot_for(now_utc)
+        if slot < 0:
+            return
         # Use local calendar date so daily patterns align across DST changes
         local_date = now_utc.astimezone(self._local_tz).date().isoformat()
 
