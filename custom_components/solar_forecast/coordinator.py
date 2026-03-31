@@ -53,7 +53,6 @@ from .const import (
     MAX_RATIO,
     MIN_CORRECTION_SAMPLES,
     MIN_RATIO,
-    MIN_TOTAL_SAMPLES_FOR_CORRECTION,
     NIGHT_THRESHOLD_W,
     SLOTS_PER_DAY,
 )
@@ -149,9 +148,19 @@ class SolarForecastCoordinator:
         """
         Compute per-slot correction factors from the full history.
 
+        Each 15-min UTC slot (0-95) gets its own factor once it has at least
+        MIN_CORRECTION_SAMPLES readings.  Slots with fewer readings default to
+        1.0 (no correction) so the refined line equals the raw line for
+        time-of-day slots that haven't been observed enough yet.
+
+        The former "overall_mean" fallback was removed because it caused a
+        bootstrap problem: just a handful of noisy twilight samples would
+        produce a very high mean that got incorrectly applied to all midday
+        slots.
+
         Returns
         -------
-        factors   : dict  slot → correction factor
+        factors   : dict  slot → correction factor (only slots with enough data)
         n_samples : int   total usable readings
         oldest    : str   ISO date of oldest reading, or None
         """
@@ -180,28 +189,13 @@ class SolarForecastCoordinator:
             slot_data[slot].append((ratio, weight))
             dates_seen.add(date_str)
 
-        # Overall weighted mean (fallback for sparse slots)
-        all_pairs = [(r, w) for vals in slot_data.values() for r, w in vals]
-        if all_pairs:
-            total_w = sum(w for _, w in all_pairs)
-            overall_mean = (
-                sum(r * w for r, w in all_pairs) / total_w if total_w > 0 else 1.0
-            )
-        else:
-            overall_mean = 1.0
-
         factors: dict[int, float] = {}
-        for slot in range(SLOTS_PER_DAY):
-            data = slot_data.get(slot, [])
+        for slot, data in slot_data.items():
             if len(data) >= MIN_CORRECTION_SAMPLES:
                 total_w = sum(w for _, w in data)
                 factors[slot] = (
-                    sum(r * w for r, w in data) / total_w
-                    if total_w > 0
-                    else overall_mean
+                    sum(r * w for r, w in data) / total_w if total_w > 0 else 1.0
                 )
-            else:
-                factors[slot] = overall_mean
 
         n_samples = sum(len(v) for v in slot_data.values())
         oldest = min(dates_seen) if dates_seen else None
@@ -334,12 +328,9 @@ class SolarForecastCoordinator:
             # Find the OM forecast value closest to this period boundary
             raw_w = self._nearest_om_value(om_data, period_end)
 
-            # Only apply corrections once enough historical data is available.
-            # Until then refined == raw so the chart lines overlap.
-            if self.total_samples >= MIN_TOTAL_SAMPLES_FOR_CORRECTION:
-                factor = self.correction_factors.get(slot, 1.0)
-            else:
-                factor = 1.0
+            # Slots not yet in correction_factors (too few samples) default to
+            # factor=1.0 so refined == raw until enough data is collected.
+            factor = self.correction_factors.get(slot, 1.0)
 
             # Only apply correction during the day; at night keep zero
             if raw_w >= NIGHT_THRESHOLD_W:
