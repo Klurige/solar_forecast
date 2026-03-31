@@ -21,6 +21,7 @@ from .const import (
     ATTR_ENERGY_TODAY_KWH,
     ATTR_ENERGY_TOMORROW_KWH,
     ATTR_FORECASTS,
+    ATTR_INTRADAY_SCALING,
     ATTR_TOTAL_SAMPLES,
     DOMAIN,
 )
@@ -154,4 +155,5 @@ class SolarForecastSensor(SensorEntity):
             ATTR_CORRECTION_FACTORS: cf_sample,
             ATTR_TOTAL_SAMPLES: self._coordinator.total_samples,
             ATTR_DATA_SINCE: self._coordinator.data_since,
+            ATTR_INTRADAY_SCALING: round(self._coordinator.intraday_scaling, 3),
         }

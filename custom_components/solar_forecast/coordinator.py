@@ -5,12 +5,17 @@ Responsibilities
 * Collect (OM-forecast-W, actual-inverter-W) pairs every 15 minutes.
 * Persist them in a local SQLite database (up to MAX_HISTORY_YEARS).
 * Compute per-slot exponentially-weighted bias-correction factors.
-* Assemble a refined 24-hour forecast at 15-minute resolution.
+* Apply an intra-day real-time scaling based on how today is tracking.
+* Assemble a refined 48-hour forecast (today + tomorrow) at 15-min resolution.
 * Notify registered sensor entities whenever the forecast changes.
 
 Correction model
 ----------------
-For each of the 96 daily time-slots (UTC-based, 0 = 00:00–00:15 UTC):
+Slots are LOCAL-time-of-day based (0 = 00:00–00:15 local, 95 = 23:45–00:00
+local).  Using local time aligns the model with the actual solar cycle and
+avoids DST drift that would corrupt per-slot learning.
+
+For each of the 96 local-time daily slots:
 
     correction_factor[s] = Σ(ratio_i × weight_i) / Σ(weight_i)
 
@@ -18,12 +23,25 @@ where
     ratio_i  = actual_W[i] / om_W[i]           (clamped to [MIN_RATIO, MAX_RATIO])
     weight_i = exp(−ln(2) / half_life × days_ago_i)
 
-Applied to the current forecast:
+Slots with fewer than MIN_CORRECTION_SAMPLES observations use factor=1.0
+(no correction) until sufficient data is available.
 
-    refined_W[s] = om_W[s] × correction_factor[s]
+Intra-day scaling
+-----------------
+Separately, a real-time "today's scaling" is computed from completed slots
+of the current day:
 
-Slots with fewer than MIN_CORRECTION_SAMPLES observations fall back to the
-overall weighted mean across all slots.
+    intraday_scaling = mean(actual_W / (om_W × correction_factor))
+
+This captures whether today's actual conditions are systematically above or
+below the refined forecast (e.g. unexpected cloud cover or unusual clarity)
+and scales the remaining future slots of today accordingly.  Tomorrow's
+slots are not affected.
+
+DB schema version
+-----------------
+Version 2 introduced local-time slots (breaking change from v1 UTC slots).
+On upgrade the readings table is cleared automatically.
 """
 
 from __future__ import annotations
@@ -49,6 +67,10 @@ from .const import (
     CONF_FORECAST_TOMORROW_ENTITY,
     CONF_POWER_ENTITY,
     CORRECTION_HALF_LIFE_DAYS,
+    DB_SCHEMA_VERSION,
+    INTRADAY_MAX_SCALING,
+    INTRADAY_MIN_SAMPLES,
+    INTRADAY_MIN_SCALING,
     MAX_HISTORY_YEARS,
     MAX_RATIO,
     MIN_CORRECTION_SAMPLES,
@@ -81,6 +103,7 @@ class SolarForecastCoordinator:
         self.correction_factors: dict[int, float] = {}
         self.total_samples: int = 0
         self.data_since: str | None = None
+        self.intraday_scaling: float = 1.0
 
     # ── Config helpers ────────────────────────────────────────────────────────
 
@@ -114,13 +137,26 @@ class SolarForecastCoordinator:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS readings (
                 date     TEXT    NOT NULL,   -- ISO date, local calendar day
-                slot     INTEGER NOT NULL,   -- 0-95, UTC-based 15-min slot
+                slot     INTEGER NOT NULL,   -- 0-95, LOCAL-time-based 15-min slot
                 om_w     REAL    NOT NULL,   -- Open Meteo forecast watts
-                actual_w REAL    NOT NULL,   -- Inverter actual watts
+                actual_w REAL    NOT NULL,   -- Inverter actual watts (15-min avg)
                 PRIMARY KEY (date, slot)
             )
             """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_slot ON readings(slot)")
+
+        # Schema migration: version 2 changed slot keys from UTC to local time.
+        # The two are incompatible so clear the table when upgrading.
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version < DB_SCHEMA_VERSION:
+            conn.execute("DELETE FROM readings")
+            conn.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
+            _LOGGER.info(
+                "Solar Forecast DB migrated to schema v%d; "
+                "historical readings cleared (slot key changed from UTC to local time)",
+                DB_SCHEMA_VERSION,
+            )
+
         conn.commit()
         return conn
 
@@ -207,6 +243,45 @@ class SolarForecastCoordinator:
         db.execute("DELETE FROM readings WHERE date < ?", (cutoff,))
         db.commit()
 
+    def _compute_intraday_scaling_sync(self) -> float:
+        """
+        Compute a real-time "today's scaling" from completed slots of today.
+
+        Compares actual production against the already-corrected (refined)
+        forecast for each completed daytime slot today.  If actual is
+        consistently above/below refined, the ratio is applied to remaining
+        future slots of today to propagate the current conditions.
+
+        Returns 1.0 when fewer than INTRADAY_MIN_SAMPLES are available.
+        """
+        db = self._ensure_db()
+        today_str = date.today().isoformat()
+
+        cursor = db.execute(
+            "SELECT slot, om_w, actual_w FROM readings WHERE date = ? AND om_w >= ?",
+            (today_str, NIGHT_THRESHOLD_W),
+        )
+
+        ratios: list[float] = []
+        for slot, om_w, actual_w in cursor:
+            factor = self.correction_factors.get(slot, 1.0)
+            refined_w = om_w * factor
+            if refined_w > 0:
+                ratios.append(actual_w / refined_w)
+
+        if len(ratios) < INTRADAY_MIN_SAMPLES:
+            return 1.0
+
+        raw_scaling = sum(ratios) / len(ratios)
+        clamped = max(INTRADAY_MIN_SCALING, min(INTRADAY_MAX_SCALING, raw_scaling))
+        _LOGGER.debug(
+            "Intra-day scaling: %.3f (from %d slots, clamped to %.3f)",
+            raw_scaling,
+            len(ratios),
+            clamped,
+        )
+        return clamped
+
     # ── Forecast parsing ──────────────────────────────────────────────────────
 
     def _parse_ts(self, ts_str: str) -> datetime | None:
@@ -285,9 +360,15 @@ class SolarForecastCoordinator:
 
         return result
 
-    def _slot_from_utc(self, dt: datetime) -> int:
-        """Return the 0-95 slot index for a UTC datetime."""
-        return (dt.hour * 60 + dt.minute) // 15
+    def _slot_from_local(self, dt: datetime) -> int:
+        """Return the 0-95 slot index based on LOCAL time of day.
+
+        Using local time ensures the model learns patterns aligned with the
+        actual solar/shadow cycle rather than UTC, which would drift by 1 h
+        across DST changes and misalign seasonal shadow patterns.
+        """
+        local = dt.astimezone(self._local_tz)
+        return (local.hour * 60 + local.minute) // 15
 
     # ── Forecast assembly ─────────────────────────────────────────────────────
 
@@ -300,11 +381,20 @@ class SolarForecastCoordinator:
         current time.  This ensures the ApexCharts card shows an unbroken line
         across the whole day even in the afternoon.
 
+        Slots are keyed by LOCAL time of day (0 = 00:00–00:15 local) so the
+        learned correction factors align with the actual shadow/solar cycle
+        rather than UTC time.
+
+        Intra-day scaling is applied only to future slots of today: if the
+        current day is tracking above/below the refined forecast, that ratio
+        is propagated into the remaining hours.  Tomorrow's slots are left
+        unchanged because tomorrow's conditions are unknown.
+
         Entry layout:
             period_end          ISO string (UTC)
-            pv_estimate         float kW  (corrected)
+            pv_estimate         float kW  (corrected + intra-day scaled)
             pv_estimate_raw     float kW  (from Open Meteo, uncorrected)
-            correction_factor   float
+            correction_factor   float     (per-slot learned factor, no intra-day)
         """
         om_data = self._collect_om_data()
         if not om_data:
@@ -313,9 +403,12 @@ class SolarForecastCoordinator:
             )
             return []
 
+        now_utc = datetime.now(timezone.utc)
+
         # Anchor to local midnight so today's past slots are included
-        now_local = datetime.now(self._local_tz)
+        now_local = now_utc.astimezone(self._local_tz)
         local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_local = now_local.date()
         first_period_end = local_midnight.astimezone(timezone.utc) + timedelta(
             minutes=15
         )
@@ -323,7 +416,7 @@ class SolarForecastCoordinator:
         entries: list[dict] = []
         for i in range(2 * SLOTS_PER_DAY):  # 192 slots = today + tomorrow
             period_end = first_period_end + timedelta(minutes=15 * i)
-            slot = self._slot_from_utc(period_end)
+            slot = self._slot_from_local(period_end)
 
             # Find the OM forecast value closest to this period boundary
             raw_w = self._nearest_om_value(om_data, period_end)
@@ -335,6 +428,13 @@ class SolarForecastCoordinator:
             # Only apply correction during the day; at night keep zero
             if raw_w >= NIGHT_THRESHOLD_W:
                 refined_w = max(0.0, raw_w * factor)
+
+                # Intra-day scaling: only for future slots of today.
+                # Tomorrow is intentionally left unscaled — we don't know
+                # whether today's weather pattern will persist.
+                period_local_date = period_end.astimezone(self._local_tz).date()
+                if period_end > now_utc and period_local_date == today_local:
+                    refined_w = max(0.0, refined_w * self.intraday_scaling)
             else:
                 refined_w = 0.0
 
@@ -439,7 +539,7 @@ class SolarForecastCoordinator:
         if om_w < NIGHT_THRESHOLD_W and actual_w < NIGHT_THRESHOLD_W:
             return
 
-        slot = self._slot_from_utc(now_utc)
+        slot = self._slot_from_local(now_utc)
         # Use local calendar date so daily patterns align across DST changes
         local_date = now_utc.astimezone(self._local_tz).date().isoformat()
 
@@ -466,6 +566,12 @@ class SolarForecastCoordinator:
         self.correction_factors = factors
         self.total_samples = total
         self.data_since = oldest
+
+        # Intra-day scaling uses correction_factors, so compute it after
+        self.intraday_scaling = await self.hass.async_add_executor_job(
+            self._compute_intraday_scaling_sync
+        )
+
         self.forecast = self._build_forecast()
 
         for cb in self._update_callbacks:
